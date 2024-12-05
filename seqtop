@@ -32,12 +32,12 @@ def get_mux_scan_data(connection):
     return scan_data
 
 
-def plot_status(scan_data):
+def plot_status(scan_data, args):
     """
     Create a stacked bar chart of mux scan results
     """
 
-    yields = get_flowcell_yields()
+    yields = get_flowcell_yields(args)
 
     # Clear the plot
     plt.clf()
@@ -82,10 +82,20 @@ def plot_status(scan_data):
         plt.yticks([])
 
         plt.subplot(1,n_plot).subplot(2,1)
-        plt.title("Log10 Count vs Read Length (excl outliers)")
+        plt.title("Read Length")
+
         hist_values = yields[posname]['hist_values']
         hist_starts = yields[posname]['hist_starts']
-        plt.plot(hist_starts, np.log10(hist_values))
+
+        if args.log:
+            hist_starts = np.asarray(hist_starts)+1
+            hist_values = np.asarray(hist_values)+1
+
+            plt.plot(np.log10(hist_starts), np.log10(hist_values))
+            plt.ylabel("log10(bp)")
+        else:
+            plt.plot(hist_starts, np.asarray(hist_values)/1e6)
+            plt.ylabel("Mbp")
 
         plt.subplot(1,n_plot).subplot(2,2)
         plt.title(f"Pores at {int(latest_time/60)} m")
@@ -128,7 +138,7 @@ def plot_status(scan_data):
     plt.show()
 
 
-def get_flowcell_yields():
+def get_flowcell_yields(args):
     """
     Monitor and return the current yield in gigabases for each active flowcell
     Returns a dictionary of position_id: yield_in_gb pairs
@@ -162,14 +172,19 @@ def get_flowcell_yields():
                 gigabases = bases / 1e9
                 gigabytes = float(acquisition_info.writer_summary.bytes_to_write_completed)/1e9
 
+                bvt = 'ReadLengths'
+
+                if args.readcounts:
+                    bvt = 'ReadCounts'
+
                 n50 = connection.statistics.read_length_n50(acquisition_run_id=acquisition_info.run_id)
-                len_hist = connection.statistics.stream_read_length_histogram(acquisition_run_id=acquisition_info.run_id, bucket_value_type='ReadCounts', discard_outlier_percent=0.05)
+                len_hist = connection.statistics.stream_read_length_histogram(acquisition_run_id=acquisition_info.run_id, bucket_value_type=bvt, discard_outlier_percent=0.25)
                 len_hist = len_hist.next()
 
                 # Extract values from histogram_data
                 hist_values = list(len_hist.histogram_data)[0].bucket_values
                 hist_starts = [br.start if hasattr(br, 'start') else 0 for br in len_hist.bucket_ranges]
-               
+
                 # Try to get timing info
                 start_time = acquisition_info.start_time.seconds
                 current_time = time.time()
@@ -236,7 +251,7 @@ def monitor(args):  # Default 5 minute interval
                    print(f"Error with position {position.name}: {str(e)}")
 
             # Plot the data
-            plot_status(scan_data)
+            plot_status(scan_data, args)
             
             time.sleep(interval)
             
@@ -246,6 +261,8 @@ def monitor(args):  # Default 5 minute interval
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='monitor minknow via command line')
     parser.add_argument('-i', '--interval', default=300, help='update interval (seconds, default = 300)')
+    parser.add_argument('--log', action='store_true', default=False, help='log axes on read length plot')
+    parser.add_argument('--readcounts', action='store_true', default=False, help='use ReadCounts instead of ReadLengths for bucket value')
     
     args = parser.parse_args()
     monitor(args)
