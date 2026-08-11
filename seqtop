@@ -73,6 +73,12 @@ def plot_status(scan_data, args):
 
         plt.subplot(1,n_plot).subplot(1,2)
         plt.title("Yield")
+        occ = yields[posname].get('occupancy')
+        if occ is None:
+            occ_txt = "Occupancy: n/a"
+        else:
+            occ_txt = f"Occupancy: {round(occ*100)}% ({yields[posname]['seq_pores']}/{yields[posname]['seq_pores']+yields[posname]['avail_pores']})"
+        plt.text(occ_txt, 0, 4, alignment='left', color="green+")
         plt.text(f"{yields[posname]['yield_gb']} Gbases", 0, 3,  alignment='left', color="blue+")
         plt.text(f"{yields[posname]['reads']} Reads", 0, 2,  alignment='left', color="blue+")
         plt.text(f"{yields[posname]['wrote_gb']} Gbytes", 0, 1, alignment='left', color="blue+")
@@ -138,6 +144,49 @@ def plot_status(scan_data, args):
     plt.show()
 
 
+def get_pore_occupancy(connection, timeout=8.0):
+    """
+    Live pore occupancy from a channel-states snapshot: the fraction of
+    sequencing-capable pores that are currently sequencing.
+
+    Returns (sequencing, available, occupancy) where
+      sequencing = channels in the 'sequencing' group (strand + adapter),
+      available  = channels in the 'pore' group (good pore, idle),
+      occupancy  = sequencing / (sequencing + available)   [0.0 - 1.0]
+    """
+    # map each channel-state name to its display group (sequencing / pore / ...)
+    desc = connection.analysis_configuration.get_channel_states_desc()
+    group_of = {s.name: g.name for g in desc.groups for s in g.states}
+
+    # upper bound on channel count (PromethION 3000, MinION 512); over-asking is harmless
+    try:
+        n_channels = connection.device.get_device_info().max_channel_count
+    except Exception:
+        n_channels = 3000
+
+    # get_channel_states streams the current state of every channel first, then
+    # streams updates forever -- take the initial snapshot and cancel.
+    latest = {}
+    deadline = time.time() + timeout
+    stream = connection.data.get_channel_states(
+        first_channel=1, last_channel=n_channels, use_channel_states_ids=False)
+    try:
+        for resp in stream:
+            before = len(latest)
+            for cs in resp.channel_states:
+                latest[cs.channel] = cs.state_name
+            # snapshot is complete once a message stops adding new channels
+            if (latest and len(latest) == before) or time.time() > deadline:
+                break
+    finally:
+        stream.cancel()
+
+    sequencing = sum(group_of.get(s) == 'sequencing' for s in latest.values())
+    available = sum(group_of.get(s) == 'pore' for s in latest.values())
+    denom = sequencing + available
+    return sequencing, available, (sequencing / denom if denom else 0.0)
+
+
 def get_flowcell_yields(args):
     """
     Monitor and return the current yield in gigabases for each active flowcell
@@ -195,6 +244,12 @@ def get_flowcell_yields(args):
                 prot_info = connection.protocol.get_run_info()
                 user_info = prot_info.user_info
 
+                # Live pore occupancy (best-effort; don't fail yields if unavailable)
+                try:
+                    seq_pores, avail_pores, occupancy = get_pore_occupancy(connection)
+                except Exception:
+                    seq_pores, avail_pores, occupancy = 0, 0, None
+
                 yields[position.name] = {
                     'hist_values': hist_values,
                     'hist_starts': hist_starts,
@@ -208,7 +263,10 @@ def get_flowcell_yields(args):
                     'sample': user_info.sample_id.value,
                     'flowcell_type': prot_info.flow_cell.product_code,
                     'flowcell_id': prot_info.flow_cell.flow_cell_id,
-                    'kit': prot_info.meta_info.tags['kit'].string_value
+                    'kit': prot_info.meta_info.tags['kit'].string_value,
+                    'occupancy': occupancy,
+                    'seq_pores': seq_pores,
+                    'avail_pores': avail_pores
                 }
             except AttributeError as e:
                 print(f"Error accessing fields: {e}")
