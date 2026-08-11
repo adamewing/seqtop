@@ -4,13 +4,13 @@ from setuptools import setup, find_packages
 
 setup(
     name='seqtop',
-    version='0.1',
+    version='0.2',
     author='Adam Ewing',
     author_email='adam.ewing@gmail.com',
     description=("monitor sequencing from the command line because GUIs have too many pixels"),
     license='MIT',
     url='https://github.com/adamewing/seqtop',
-    download_url='https://github.com/adamewing/seqtop/archive/refs/tags/0.1.tar.gz',
+    download_url='https://github.com/adamewing/seqtop/archive/refs/tags/0.2.tar.gz',
     scripts=['seqtop'],
     packages=find_packages(),
     install_requires = [
