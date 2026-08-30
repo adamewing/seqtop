@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 
 from minknow_api.manager import Manager
+from minknow_api import protocol_pb2
+from minknow_api import statistics_pb2
 import plotext as plt
 from collections import defaultdict
 import time
@@ -32,6 +34,238 @@ def get_mux_scan_data(connection):
     return scan_data
 
 
+def available_pores(counts):
+    """
+    Pores available for sequencing from a mux-scan counts dict: the good single
+    pores whether currently active ('single_pore') or held for a later mux
+    ('reserved_pore'). Mirrors MinKNOW's 'available' more closely than
+    single_pore alone.
+    """
+    return counts.get('single_pore', 0) + counts.get('reserved_pore', 0)
+
+
+# protocol phases worth calling out in the run-info panel: (label, display colour)
+_PHASE_DISPLAY = {
+    protocol_pb2.ProtocolPhase.PHASE_SEQUENCING: ("Sequencing", "green+"),
+    protocol_pb2.ProtocolPhase.PHASE_PREPARING_FOR_MUX_SCAN: ("PREPARING MUX SCAN", "yellow+"),
+    protocol_pb2.ProtocolPhase.PHASE_MUX_SCAN: ("MUX SCAN IN PROGRESS", "yellow+"),
+    protocol_pb2.ProtocolPhase.PHASE_PAUSED: ("PAUSED", "red+"),
+    protocol_pb2.ProtocolPhase.PHASE_PAUSING: ("Pausing", "red+"),
+    protocol_pb2.ProtocolPhase.PHASE_RESUMING: ("Resuming", "blue+"),
+    protocol_pb2.ProtocolPhase.PHASE_INITIALISING: ("Initialising", "blue+"),
+    protocol_pb2.ProtocolPhase.PHASE_COMPLETED: ("Completed", "blue+"),
+}
+
+
+def phase_label(phase):
+    """Human label + display colour for a protocol phase (see ProtocolPhase enum)."""
+    if phase in _PHASE_DISPLAY:
+        return _PHASE_DISPLAY[phase]
+    # auto-pause / error phases: derive a readable label from the enum name
+    name = protocol_pb2.ProtocolPhase.Name(phase).replace("PHASE_", "").replace("_", " ").title()
+    return (name, "red+")
+
+
+def is_mux_scanning(phase):
+    """True while a mux scan is being prepared or is running."""
+    return phase in (protocol_pb2.ProtocolPhase.PHASE_PREPARING_FOR_MUX_SCAN,
+                     protocol_pb2.ProtocolPhase.PHASE_MUX_SCAN)
+
+
+def get_activity_series(connection, run_id):
+    """
+    Per-minute throughput history for a run -- the "Throughput" line plot.
+
+    Pulls the first (already-complete) snapshot from
+    statistics.stream_acquisition_output and returns a list of
+    (seconds, cumulative_bases, cumulative_reads) tuples sorted by time.
+    Cumulative values are differenced by activity_rates() to get a rate.
+    """
+    stream = connection.statistics.stream_acquisition_output(acquisition_run_id=run_id)
+    resp = None
+    try:
+        for resp in stream:
+            break  # first response carries the full history
+    finally:
+        stream.cancel()
+
+    if resp is None:
+        return []
+
+    # With no split/filter requested MinKNOW returns a single aggregate group
+    # whose `filtering` is empty; prefer it, else fall back to the first group.
+    groups = list(resp.snapshots)
+    if not groups:
+        return []
+    agg = next((g for g in groups if len(g.filtering) == 0), groups[0])
+
+    series = [
+        (s.seconds,
+         float(s.yield_summary.estimated_selected_bases),
+         int(s.yield_summary.read_count))
+        for s in agg.snapshots
+    ]
+    series.sort(key=lambda x: x[0])
+    return series
+
+
+def activity_rates(series):
+    """
+    Convert a cumulative (seconds, bases, reads) series into per-bin throughput.
+    Returns (minutes, mb_per_min) as parallel lists, one point per bin gap.
+    """
+    minutes, mb_per_min = [], []
+    for (t0, b0, _), (t1, b1, _) in zip(series, series[1:]):
+        dt_min = (t1 - t0) / 60.0
+        if dt_min <= 0:
+            continue
+        minutes.append(t1 / 60.0)
+        mb_per_min.append((b1 - b0) / 1e6 / dt_min)
+    return minutes, mb_per_min
+
+
+# Channel-state groups in the pore-activity stacked bar, listed TOP to BOTTOM as
+# they should appear in the plot. plotext stacks the first series at the BOTTOM,
+# so get_duty_time_series builds the series in the reverse of this order. Any
+# group MinKNOW reports that isn't listed here is stacked on top (so a new group
+# still shows up rather than being dropped).
+_DUTY_GROUP_ORDER_TOP_TO_BOTTOM = ['unclassified', 'inactive', 'recovering', 'pore', 'sequencing']
+
+# plotext colour per channel-state group in the pore-activity/duty-time bar.
+# ('+' = the bright/light ANSI variant.) Unlisted groups fall back to white.
+_DUTY_GROUP_COLORS = {
+    'sequencing':   'green+',   # light green
+    'pore':         'green',    # dark green
+    'recovering':   'blue',     # dark blue
+    'inactive':     'blue+',    # light blue
+    'unclassified': 'gray',     # grey
+}
+
+
+def get_duty_time_series(connection, run_id, elapsed_sec):
+    """
+    Per-bucket channel-state history -- MinKNOW's "Pore activity"/duty-time plot,
+    the fine-grained cousin of the coarse (one-bar-per-mux-scan) mux history bar.
+
+    Pulls statistics.stream_duty_time, which reports the time each channel state
+    accumulated (summed over all channels) within each time bucket, and folds the
+    raw states into their display groups (sequencing / pore / recovering / ...) --
+    the same grouping get_pore_occupancy uses. Each bucket is normalised to a
+    percentage, so the stacked bar reads as "% of channel-time in each state" and
+    is independent of the raw time unit the API reports.
+
+    Bucket width is chosen to yield ~60 bars regardless of run length (never finer
+    than one per minute), so a longer run just packs more time into each bar. Returns
+    (minutes, {group: [pct per bucket]}, groups) where `minutes` is one x-value per
+    bucket and `groups` is the categories in plotext series order -- bottom-to-top,
+    i.e. the reverse of _DUTY_GROUP_ORDER_TOP_TO_BOTTOM. Empty tuple contents if
+    nothing came back.
+    """
+    # group each raw channel state into its display group (sequencing / pore / ...)
+    desc = connection.analysis_configuration.get_channel_states_desc()
+    group_of = {st.name: g.name for g in desc.groups for st in g.states}
+
+    # aim for ~60 buckets across the whole run, but no finer than 1/minute
+    elapsed = max(int(elapsed_sec), 60)
+    step = max(60, elapsed // 60)
+    sel = statistics_pb2.DataSelection(start=0, step=step, end=elapsed + step)
+
+    stream = connection.statistics.stream_duty_time(
+        acquisition_run_id=run_id, data_selection=sel)
+    resp = None
+    try:
+        for resp in stream:
+            break  # first response carries the full history
+    finally:
+        stream.cancel()
+    if resp is None:
+        return [], {}, []
+
+    buckets = list(resp.bucket_ranges)
+    n = len(buckets)
+    if n == 0:
+        return [], {}, []
+
+    # channel_states is a proto map: state name -> ChannelStateData(state_times).
+    # group_totals[group][bucket] = summed channel-time in that group's states.
+    group_totals = defaultdict(lambda: [0.0] * n)
+    for state_name, csd in resp.channel_states.items():
+        grp = group_of.get(state_name, state_name)
+        state_times = list(csd.state_times)
+        for i in range(min(n, len(state_times))):
+            group_totals[grp][i] += float(state_times[i])
+
+    # Series order is bottom-to-top (plotext stacks series[0] at the bottom), i.e.
+    # the reverse of the desired top-to-bottom display order. Unknown groups the
+    # API reported are appended last, so they stack on top.
+    bottom_to_top = list(reversed(_DUTY_GROUP_ORDER_TOP_TO_BOTTOM))
+    groups = [g for g in bottom_to_top if g in group_totals]
+    groups += [g for g in group_totals if g not in groups]
+
+    # normalise each bucket to percentages (unit-independent, always sums to 100)
+    pct = {g: [0.0] * n for g in groups}
+    for i in range(n):
+        total = sum(group_totals[g][i] for g in groups)
+        if total > 0:
+            for g in groups:
+                pct[g][i] = 100.0 * group_totals[g][i] / total
+
+    minutes = [b.start / 60.0 for b in buckets]
+    return minutes, pct, groups
+
+
+def detect_flatline(series, args, min_time=None):
+    """
+    Flag a throughput flatline: recent bases/min has collapsed relative to a
+    preceding baseline (the pattern a mux scan revives on RNA004 flow cells).
+
+    Returns (is_flatline, info) where info carries baseline/recent Mb/min for
+    logging. All thresholds are in Mb/min:
+
+      baseline = 90th-percentile ("healthy plateau") rate over the
+                 `--flatline-baseline-min` minutes that precede the recent
+                 window,
+      recent   = mean rate over the last `--flatline-sustain-min` minutes,
+      flatline when baseline >= --flatline-floor  AND
+                    recent < --flatline-drop * baseline.
+
+    A near-peak (90th pct) baseline rather than the median is deliberate: a slow
+    multi-minute fade drags a median baseline down with it, so the drop hides
+    itself and never trips (observed live). The 90th percentile stays anchored
+    to the level the flow cell was actually achieving, so gradual fades are
+    caught, while a gentle healthy taper (recent still well above drop*plateau)
+    is not.
+
+    The floor stops it firing on runs that are simply winding down (nothing for
+    a scan to recover) or early/idle runs with little activity to lose.
+
+    `min_time` (seconds since acquisition start) discards all bins at or before
+    it -- used to exclude the near-zero throughput trough a mux scan itself
+    produces, so the recovery right after a scan isn't misread as a flatline.
+    """
+    if min_time is not None:
+        series = [pt for pt in series if pt[0] > min_time]
+    minutes, rates = activity_rates(series)
+    sustain = max(1, int(args.flatline_sustain_min))
+    baseline_n = max(1, int(args.flatline_baseline_min))
+
+    if len(rates) < sustain + 1:
+        return False, {}
+
+    recent = rates[-sustain:]
+    baseline_slice = rates[-(sustain + baseline_n):-sustain]
+    if not baseline_slice:
+        return False, {}
+
+    baseline = float(np.percentile(baseline_slice, 90))
+    recent_mean = float(np.mean(recent))
+    info = {'baseline': round(baseline, 2), 'recent': round(recent_mean, 2)}
+
+    if baseline < float(args.flatline_floor):
+        return False, info
+    return recent_mean < float(args.flatline_drop) * baseline, info
+
+
 def plot_status(scan_data, args):
     """
     Create a stacked bar chart of mux scan results
@@ -43,9 +277,35 @@ def plot_status(scan_data, args):
     plt.clf()
     plt.theme('dark')
 
-    plt.subplots(2,len(scan_data))
-    
-    # mux plots
+    # Which plot rows to show under the info grid, top to bottom. The pore-activity
+    # (duty-time) stacked bar is the default headline; the throughput line and the
+    # coarse mux-scan history bar are opt-in (--throughput / --mux-history).
+    plot_rows = []
+    if not args.no_pore_activity:
+        plot_rows.append('pore_activity')
+    if args.throughput:
+        plot_rows.append('throughput')
+    if args.mux_history:
+        plot_rows.append('mux')
+
+    n_rows = 1 + len(plot_rows)
+    plt.subplots(n_rows, len(scan_data))
+
+    # Row heights: give the text-heavy top grid just enough to show its lines
+    # (~16 rows fits all 6 without clipping) and split everything else evenly
+    # across the enabled plot rows, so they stay as large as the screen allows.
+    # (plotext won't reflow freed space automatically, so set all rows.)
+    th = plt.th()
+    # The figure fills the screen (total height = th). The plot rows get PLOT_FRAC
+    # of that height and the top 2x2 grid absorbs the rest, so lowering PLOT_FRAC
+    # shrinks the duty-time plot's vertical share (the grid grows to compensate).
+    PLOT_FRAC = 0.6
+    if plot_rows:
+        info_h = max(14, th - int(th * PLOT_FRAC))   # grid takes the remainder
+        plot_h = max(5, (th - info_h) // len(plot_rows))
+    else:
+        info_h = th
+        plot_h = info_h
 
     n_plot = 0
 
@@ -56,12 +316,16 @@ def plot_status(scan_data, args):
 
         latest_time, latest_counts = mux_data[-1]
 
-        plt.subplot(1,n_plot)
+        plt.subplot(1,n_plot).plotsize(None, info_h)
 
         plt.subplot(1,n_plot).subplots(2,2)
 
         plt.subplot(1,n_plot).subplot(1,1)
-        plt.title(f"{posname}")
+        phase = yields[posname].get('phase')
+        scan_tag = "  >> MUX SCAN <<" if is_mux_scanning(phase) else ""
+        plt.title(f"{posname}{scan_tag}")
+        status_txt, status_color = phase_label(phase) if phase is not None else ("", "blue+")
+        plt.text(f"Status: {status_txt}", 0, 5, alignment='left', color=status_color)
         plt.text(f"Elapsed: {yields[posname]['elapsed_time']}", 0, 4, alignment='left', color="blue+")
         plt.text(f"Sample: {yields[posname]['sample']}", 0, 3, alignment='left', color="blue+")
         plt.text(f"Flowcell Type: {yields[posname]['flowcell_type']}", 0, 2, alignment='left', color="blue+")
@@ -105,40 +369,74 @@ def plot_status(scan_data, args):
 
         plt.subplot(1,n_plot).subplot(2,2)
         plt.title(f"Pores at {int(latest_time/60)} m")
-        plt.text(f"Available:   {latest_counts['single_pore']}", 0, 6, alignment='left', color="blue+")
-        plt.text(f"Saturated:   {latest_counts['saturated']}", 0, 5, alignment='left', color="blue+")
-        plt.text(f"Zero:        {latest_counts['zero']}", 0, 4, alignment='left', color="blue+")
-        plt.text(f"Unavailable: {latest_counts['unavailable']}", 0, 3, alignment='left', color="blue+")
-        plt.text(f"Reserved:    {latest_counts['reserved_pore']}", 0, 2, alignment='left', color="blue+")
+        plt.text(f"Available:   {available_pores(latest_counts)}", 0, 5, alignment='left', color="blue+")
+        plt.text(f"Saturated:   {latest_counts['saturated']}", 0, 4, alignment='left', color="blue+")
+        plt.text(f"Zero:        {latest_counts['zero']}", 0, 3, alignment='left', color="blue+")
+        plt.text(f"Unavailable: {latest_counts['unavailable']}", 0, 2, alignment='left', color="blue+")
         plt.text(f"Other:       {latest_counts['other']}", 0, 1, alignment='left', color="blue+")
         plt.text(f"Multiple:    {latest_counts['multiple']}", 0, 0, alignment='left', color="blue+")
         plt.xlim(0,None)
         plt.xticks([])
         plt.yticks([])
-        
 
-        plt.subplot(2,n_plot)
-        plt.plotsize(None, plt.th()//1.8)
+        # Plot rows under the info grid, in the order chosen above. Row 1 is the
+        # info grid; plot rows start at row 2.
+        for row_idx, kind in enumerate(plot_rows, start=2):
+            plt.subplot(row_idx, n_plot)
+            plt.plotsize(None, plot_h)
 
-        # Create lists of values for each category
-        values = defaultdict(list)
-        for _, counts in mux_data:
-            for cat in categories:
-                values[cat].append(counts.get(cat, 0))
+            if kind == 'pore_activity':
+                # Fine-grained channel-state history: % of channel-time per state
+                # per time bucket = MinKNOW's "Pore activity"/duty-time plot.
+                plt.title("Pore Activity")
+                dt_minutes = yields[posname].get('duty_minutes') or []
+                dt_pct = yields[posname].get('duty_pct') or {}
+                dt_groups = yields[posname].get('duty_groups') or []
+                if dt_minutes and dt_groups:
+                    plt.stacked_bar(
+                        dt_minutes,
+                        [dt_pct[g] for g in dt_groups],
+                        labels=dt_groups,
+                        color=[_DUTY_GROUP_COLORS.get(g, 'white') for g in dt_groups],
+                        width=50,
+                    )
+                    plt.xlabel("Minutes")
+                    plt.ylabel("% channels")
+                else:
+                    plt.text("Pore activity: n/a", 0, 0, alignment='left', color="blue+")
+                    plt.xticks([])
+                    plt.yticks([])
 
-        # Convert timestamps to minutes for readability
-        times = [int(t/60) for t, _ in mux_data]
+            elif kind == 'throughput':
+                # Throughput over time (Mb/min) = MinKNOW's activity barchart.
+                plt.title("Throughput")
+                act_minutes = yields[posname].get('act_minutes') or []
+                act_mbpm = yields[posname].get('act_mbpm') or []
+                if act_minutes:
+                    plt.plot(act_minutes, act_mbpm, marker="braille", color="green+")
+                    plt.xlabel("Minutes")
+                    plt.ylabel("Mb/min")
+                else:
+                    plt.text("Throughput: n/a", 0, 0, alignment='left', color="blue+")
+                    plt.xticks([])
+                    plt.yticks([])
 
-        # Create stacked bar chart
-        plt.stacked_bar(
-            times,
-            [values[cat] for cat in categories],
-            labels=categories,
-            width=50
-        )
-        
-        plt.xlabel("Minutes")
-        plt.ylabel("Pores")
+            elif kind == 'mux':
+                # Coarse pore-state history: one stacked bar per mux scan.
+                plt.title("Mux Scan History")
+                values = defaultdict(list)
+                for _, counts in mux_data:
+                    for cat in categories:
+                        values[cat].append(counts.get(cat, 0))
+                times = [int(t/60) for t, _ in mux_data]
+                plt.stacked_bar(
+                    times,
+                    [values[cat] for cat in categories],
+                    labels=categories,
+                    width=50,
+                )
+                plt.xlabel("Minutes")
+                plt.ylabel("Pores")
     
     # Show the plot
     plt.show()
@@ -250,6 +548,28 @@ def get_flowcell_yields(args):
                 except Exception:
                     seq_pores, avail_pores, occupancy = 0, 0, None
 
+                # Pore-activity (duty-time) history -- the default stacked bar
+                # (best-effort; skipped when the plot is turned off)
+                if not args.no_pore_activity:
+                    try:
+                        duty_minutes, duty_pct, duty_groups = get_duty_time_series(
+                            connection, acquisition_info.run_id, run_time_seconds)
+                    except Exception:
+                        duty_minutes, duty_pct, duty_groups = [], {}, []
+                else:
+                    duty_minutes, duty_pct, duty_groups = [], {}, []
+
+                # Throughput history for the throughput plot (best-effort; only
+                # fetched when that opt-in plot is enabled)
+                if args.throughput:
+                    try:
+                        act_minutes, act_mbpm = activity_rates(
+                            get_activity_series(connection, acquisition_info.run_id))
+                    except Exception:
+                        act_minutes, act_mbpm = [], []
+                else:
+                    act_minutes, act_mbpm = [], []
+
                 yields[position.name] = {
                     'hist_values': hist_values,
                     'hist_starts': hist_starts,
@@ -266,7 +586,13 @@ def get_flowcell_yields(args):
                     'kit': prot_info.meta_info.tags['kit'].string_value,
                     'occupancy': occupancy,
                     'seq_pores': seq_pores,
-                    'avail_pores': avail_pores
+                    'avail_pores': avail_pores,
+                    'act_minutes': act_minutes,
+                    'act_mbpm': act_mbpm,
+                    'duty_minutes': duty_minutes,
+                    'duty_pct': duty_pct,
+                    'duty_groups': duty_groups,
+                    'phase': prot_info.phase
                 }
             except AttributeError as e:
                 print(f"Error accessing fields: {e}")
@@ -275,6 +601,203 @@ def get_flowcell_yields(args):
             yields[position.name] = f"No active sequencing run (Status: {run_info.status})"
                 
     return yields
+
+
+def send_ntfy_message(args, title, body, tags="dna"):
+    """
+    POST a single message to the configured ntfy topic. No-op if --ntfy is unset.
+
+    --ntfy may be a bare topic ("mytopic") or a full URL
+    ("https://ntfy.example.com/mytopic").
+    """
+    if not args.ntfy:
+        return
+    import requests
+
+    url = args.ntfy if args.ntfy.startswith("http") else f"https://ntfy.sh/{args.ntfy}"
+    try:
+        requests.post(
+            url,
+            data=body.encode("utf-8"),
+            headers={"Title": title, "Tags": tags},
+            timeout=15,
+        )
+        print(f"ntfy: '{title}' sent to {url}")
+    except Exception as e:
+        print(f"ntfy post failed: {e}")
+
+
+def send_ntfy_update(args, scan_data):
+    """
+    Post a summary of each active position to an ntfy topic: Gbp sequenced,
+    available pore count (from the last mux scan), and pore occupancy.
+    """
+    yields = get_flowcell_yields(args)
+
+    lines = []
+    for posname, mux_data in scan_data.items():
+        y = yields.get(posname)
+        if not isinstance(y, dict):
+            continue
+        available = available_pores(mux_data[-1][1]) if mux_data else '?'
+        occ = y.get('occupancy')
+        occ_txt = 'n/a' if occ is None else f"{round(occ * 100)}%"
+        lines.append(
+            f"{posname} ({y.get('sample', '?')}): "
+            f"{y.get('yield_gb', '?')} Gbp | {available} pores avail | {occ_txt} occupancy"
+        )
+
+    body = "\n".join(lines) if lines else "No active sequencing runs."
+    send_ntfy_message(args, "seqtop sequencing update", body)
+
+
+def maybe_trigger_mux_scan(connection, args, posname, last_trigger, spent_notified):
+    """
+    If --auto-mux-scan is set: detect a throughput flatline and, when found, ask
+    the protocol to run a mux scan (which revives stalled RNA004 pores).
+
+    Guards, so a scan's own throughput dip can't provoke another one:
+      * only while actively sequencing (not mid-scan, pausing, etc.);
+      * only if the protocol permits triggering;
+      * only if the flow cell isn't spent -- stops once the latest scan's
+        available pore count falls below --min-available-pores (a dead cell
+        won't be revived by more scanning; alerts once via `spent_notified`);
+      * not within --mux-scan-cooldown minutes of the *last actual mux scan*
+        from ANY source (read from mux_scan_results, so MinKNOW's own scheduled
+        scans count too, not just seqtop's);
+      * detection ignores throughput from during/just after that scan.
+    Returns True if a scan was fired.
+    """
+    run_info = connection.protocol.get_run_info()
+    # Skip unless actively sequencing -- a scan already in progress dips
+    # throughput and would otherwise look like a flatline.
+    if run_info.phase != protocol_pb2.ProtocolPhase.PHASE_SEQUENCING:
+        return False
+    if not run_info.can_trigger_mux_scan:
+        return False
+
+    acq = connection.acquisition.get_acquisition_info()
+    run_id = acq.run_id
+    cooldown_s = float(args.mux_scan_cooldown) * 60
+
+    # Most recent mux scan (seconds since acquisition start), from any source;
+    # the activity series uses the same time base.
+    scans = sorted(acq.bream_info.mux_scan_results, key=lambda s: s.mux_scan_timestamp)
+    last_scan_sec = scans[-1].mux_scan_timestamp if scans else None
+    now_sec = time.time() - acq.start_time.seconds
+
+    # Flow cell spent? Available pores (single + reserved) from the latest scan.
+    # A cell this far gone won't be revived by more scanning -- stop, alert once.
+    if scans:
+        avail = available_pores({k: v for k, v in scans[-1].counts.items()})
+        if avail < float(args.min_available_pores):
+            if posname not in spent_notified:
+                spent_notified.add(posname)
+                spent_msg = (f"{posname}: flow cell appears spent -- {avail} available "
+                             f"pores (< {int(args.min_available_pores)}); auto mux scan disabled")
+                print(f"  !! {spent_msg}")
+                send_ntfy_message(args, "seqtop: flow cell spent", spent_msg, tags="skull,dna")
+            return False
+
+    if last_scan_sec is not None and (now_sec - last_scan_sec) < cooldown_s:
+        print(f"  [{posname}] last mux scan {(now_sec - last_scan_sec) / 60:.1f} min ago "
+              f"(< {args.mux_scan_cooldown} min cooldown); not triggering")
+        return False
+
+    # Belt-and-braces: also honour seqtop's own last trigger (covers the brief
+    # window after we fire, before the scan registers in mux_scan_results).
+    if time.time() - last_trigger.get(posname, 0.0) < cooldown_s:
+        return False
+
+    try:
+        series = get_activity_series(connection, run_id)
+    except Exception as e:
+        print(f"  [{posname}] activity fetch failed: {e}")
+        return False
+
+    # Ignore the scan's own trough + a few minutes of pore ramp-up afterwards.
+    settle_sec = 3 * 60
+    min_time = (last_scan_sec + settle_sec) if last_scan_sec is not None else None
+
+    is_flat, info = detect_flatline(series, args, min_time=min_time)
+    if not is_flat:
+        return False
+
+    drop_txt = f"{info.get('baseline')} -> {info.get('recent')} Mb/min"
+    msg = f"{posname}: throughput flatline ({drop_txt}) - triggering mux scan"
+    print(f"  !! {msg}")
+    try:
+        connection.protocol.trigger_mux_scan()
+        last_trigger[posname] = time.time()
+        send_ntfy_message(args, "seqtop: mux scan triggered", msg, tags="warning,dna")
+        return True
+    except Exception as e:
+        print(f"  [{posname}] trigger_mux_scan failed: {e}")
+        return False
+
+
+def maybe_notify_flatline(connection, args, posname, flatline_notified, last_trigger):
+    """
+    Notify-only flatline watch: whenever --ntfy is set (independent of
+    --auto-mux-scan), POST a one-off alert if a run's throughput has collapsed to
+    near-zero while no mux scan is running -- the "MinKNOW still says PROCESSING
+    but nothing is being produced" case (e.g. a frozen/zombie acquisition after a
+    protocol-script crash, which a mux scan won't fix).
+
+    Detection reuses detect_flatline (so it inherits the baseline floor that
+    ignores winding-down runs, and the min_time that excludes a mux scan's own
+    throughput trough), gated by an absolute near-zero ceiling
+    (--flatline-notify-floor) so only genuine zero/near-zero throughput alerts,
+    not a partial drop. This catches the flatline at onset (while the baseline
+    still holds healthy history); once the flat period fills the baseline window
+    the test stops firing, so the per-position `flatline_notified` set both
+    de-duplicates (one alert per episode) and is cleared on real recovery.
+
+    A mux scan legitimately drops throughput to ~0, so nothing alerts while one
+    runs; and if --auto-mux-scan just fired for this position (within the mux-scan
+    cooldown), that path's own alert stands and this one stays quiet.
+    """
+    if not args.ntfy:
+        return
+    try:
+        run_info = connection.protocol.get_run_info()
+        if is_mux_scanning(run_info.phase):
+            return
+
+        acq = connection.acquisition.get_acquisition_info()
+        scans = sorted(acq.bream_info.mux_scan_results, key=lambda s: s.mux_scan_timestamp)
+        last_scan_sec = scans[-1].mux_scan_timestamp if scans else None
+        settle_sec = 3 * 60
+        min_time = (last_scan_sec + settle_sec) if last_scan_sec is not None else None
+
+        series = get_activity_series(connection, acq.run_id)
+        is_flat, info = detect_flatline(series, args, min_time=min_time)
+    except Exception as e:
+        print(f"  [{posname}] flatline notify check failed: {e}")
+        return
+
+    recent = info.get('recent')
+    if recent is None:
+        return  # not enough history to judge yet
+    floor = float(args.flatline_notify_floor)
+
+    if is_flat and recent <= floor:
+        # Auto mux scan (if on) just fired for this position -> it already alerted.
+        if time.time() - last_trigger.get(posname, 0.0) < float(args.mux_scan_cooldown) * 60:
+            return
+        if posname in flatline_notified:
+            return
+        flatline_notified.add(posname)
+        sample = run_info.user_info.sample_id.value
+        gbp = round(float(acq.yield_summary.estimated_selected_bases) / 1e9, 2)
+        msg = (f"{posname} ({sample}): throughput flatlined to {recent} Mb/min "
+               f"(baseline {info.get('baseline')}); no mux scan running. "
+               f"Yield {gbp} Gbp -- run may be stalled or frozen.")
+        print(f"  !! {msg}")
+        send_ntfy_message(args, "seqtop: run flatlined", msg, tags="rotating_light,dna")
+    elif recent > floor:
+        # genuinely producing again -> reset so the next flatline re-alerts
+        flatline_notified.discard(posname)
 
 
 def monitor(args):  # Default 5 minute interval
@@ -286,7 +809,18 @@ def monitor(args):  # Default 5 minute interval
     # Connect to the MinKNOW server
     interval = int(args.interval)
     manager = Manager()
-    
+
+    # ntfy periodic notifications (opt-in via --ntfy)
+    ntfy_interval_s = float(args.ntfy_interval) * 60 if args.ntfy else None
+    last_ntfy = 0.0   # 0 => send on the first loop iteration
+
+    # per-position timestamp of the last auto-triggered mux scan (for cooldown)
+    last_trigger = {}
+    # positions already alerted as spent (so the alert fires once, not every poll)
+    spent_notified = set()
+    # positions already alerted as flatlined (one ntfy per flatline episode)
+    flatline_notified = set()
+
     try:
         while True:
             print(f"\nChecking mux scans at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -301,7 +835,15 @@ def monitor(args):  # Default 5 minute interval
                     if run_info.status == 3:  # Running
                         print(f"\nPosition: {position.name}")
                         scan_data[position.name] = get_mux_scan_data(connection)
-                        
+
+                        # Flatline watch -> auto mux scan (opt-in via --auto-mux-scan)
+                        if args.auto_mux_scan:
+                            maybe_trigger_mux_scan(connection, args, position.name, last_trigger, spent_notified)
+
+                        # Flatline watch -> notify only (whenever --ntfy is set)
+                        if args.ntfy:
+                            maybe_notify_flatline(connection, args, position.name, flatline_notified, last_trigger)
+
                     else:
                         print(f"\nPosition {position.name}: No active sequencing run")
                         
@@ -310,7 +852,12 @@ def monitor(args):  # Default 5 minute interval
 
             # Plot the data
             plot_status(scan_data, args)
-            
+
+            # Periodic ntfy notification (independent of the --interval poll rate)
+            if args.ntfy and (time.time() - last_ntfy) >= ntfy_interval_s:
+                send_ntfy_update(args, scan_data)
+                last_ntfy = time.time()
+
             time.sleep(interval)
             
     except KeyboardInterrupt:
@@ -321,6 +868,19 @@ if __name__ == "__main__":
     parser.add_argument('-i', '--interval', default=300, help='update interval (seconds, default = 300)')
     parser.add_argument('--log', action='store_true', default=False, help='log axes on read length plot')
     parser.add_argument('--readcounts', action='store_true', default=False, help='use ReadCounts instead of ReadLengths for bucket value')
-    
+    parser.add_argument('--throughput', action='store_true', default=False, help='also show the throughput plot (Mb/min over time)')
+    parser.add_argument('--mux-history', action='store_true', default=False, help='also show the coarse mux-scan pore-count stacked bar (one bar per scan)')
+    parser.add_argument('--no-pore-activity', action='store_true', default=False, help='hide the per-bucket pore-activity (duty-time) stacked bar shown by default')
+    parser.add_argument('--ntfy', default=None, help='ntfy topic (or full URL) to post periodic stats to, e.g. my_topic or https://ntfy.sh/my_topic')
+    parser.add_argument('--ntfy-interval', default=60, type=float, help='minutes between ntfy notifications (default = 60)')
+    parser.add_argument('--flatline-notify-floor', default=0.2, type=float, help='when --ntfy is set, send a one-off alert if recent throughput falls to/below this near-zero level (Mb/min) while no mux scan is running (default = 0.2); separate from --auto-mux-scan')
+    parser.add_argument('--auto-mux-scan', action='store_true', default=False, help='auto-trigger a mux scan when a throughput flatline is detected (revives stalled RNA004 pores); alerts via --ntfy if set')
+    parser.add_argument('--flatline-baseline-min', default=30, type=float, help='minutes of throughput history used as the pre-drop baseline (default = 30; long enough to sit above a slow fade)')
+    parser.add_argument('--flatline-sustain-min', default=5, type=float, help='minutes the drop must persist to count as a flatline (default = 5)')
+    parser.add_argument('--flatline-drop', default=0.3, type=float, help='flatline when recent rate falls below this fraction of baseline (default = 0.3)')
+    parser.add_argument('--flatline-floor', default=0.5, type=float, help='min baseline throughput (Mb/min) for detection to apply; below this the run is treated as winding down (default = 0.5)')
+    parser.add_argument('--mux-scan-cooldown', default=30, type=float, help='minimum minutes after any mux scan (incl. MinKNOW-scheduled ones) before auto-triggering another, per position (default = 30)')
+    parser.add_argument('--min-available-pores', default=1000, type=float, help='stop auto-triggering mux scans once the latest scan reports fewer available pores than this -- the flow cell is spent (default = 1000)')
+
     args = parser.parse_args()
     monitor(args)

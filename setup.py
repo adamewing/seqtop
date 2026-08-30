@@ -17,6 +17,7 @@ setup(
         'minknow-api',
         'plotext',
         'numpy',
+        'requests',
     ],
     classifiers=[
         'Development Status :: 4 - Beta',
