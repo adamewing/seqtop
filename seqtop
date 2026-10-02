@@ -3,11 +3,20 @@
 from minknow_api.manager import Manager
 from minknow_api import protocol_pb2
 from minknow_api import statistics_pb2
+import grpc
 import plotext as plt
 from collections import defaultdict
 import time
 import numpy as np
 import argparse
+
+# Deadline (seconds) for the "take the first response then cancel" statistics
+# streams. Their first response is computed server-side and arrives in well under
+# a second on a healthy run, but a PAUSED/quiet run can leave a stream open with
+# nothing to emit -- without a deadline the read would block forever and hang the
+# whole monitor loop. On timeout the call raises grpc.RpcError, which the callers
+# already treat as "no data this poll".
+_STREAM_TIMEOUT_S = 15
 
 
 def get_mux_scan_data(connection):
@@ -72,6 +81,14 @@ def is_mux_scanning(phase):
                      protocol_pb2.ProtocolPhase.PHASE_MUX_SCAN)
 
 
+def is_paused(phase):
+    """True while a run is paused or transitioning in/out of a pause. Throughput
+    is legitimately ~0 in these phases, so the flatline watch must ignore them."""
+    return phase in (protocol_pb2.ProtocolPhase.PHASE_PAUSED,
+                     protocol_pb2.ProtocolPhase.PHASE_PAUSING,
+                     protocol_pb2.ProtocolPhase.PHASE_RESUMING)
+
+
 def get_activity_series(connection, run_id):
     """
     Per-minute throughput history for a run -- the "Throughput" line plot.
@@ -81,7 +98,8 @@ def get_activity_series(connection, run_id):
     (seconds, cumulative_bases, cumulative_reads) tuples sorted by time.
     Cumulative values are differenced by activity_rates() to get a rate.
     """
-    stream = connection.statistics.stream_acquisition_output(acquisition_run_id=run_id)
+    stream = connection.statistics.stream_acquisition_output(
+        acquisition_run_id=run_id, _timeout=_STREAM_TIMEOUT_S)
     resp = None
     try:
         for resp in stream:
@@ -171,7 +189,7 @@ def get_duty_time_series(connection, run_id, elapsed_sec):
     sel = statistics_pb2.DataSelection(start=0, step=step, end=elapsed + step)
 
     stream = connection.statistics.stream_duty_time(
-        acquisition_run_id=run_id, data_selection=sel)
+        acquisition_run_id=run_id, data_selection=sel, _timeout=_STREAM_TIMEOUT_S)
     resp = None
     try:
         for resp in stream:
@@ -288,8 +306,22 @@ def plot_status(scan_data, args):
     if args.mux_history:
         plot_rows.append('mux')
 
+    # Only positions with both yield data and at least one completed mux scan can be
+    # rendered. Between runs (samples loading, or a run just starting) a position can
+    # report "running" with no mux scans yet -- get_flowcell_yields then stores an
+    # error string instead of a dict, and mux_data is empty. Skip those rather than
+    # crash on mux_data[-1] / yields[posname] indexing; they reappear once the first
+    # mux scan completes.
+    renderable = {
+        name: md for name, md in scan_data.items()
+        if md and isinstance(yields.get(name), dict)
+    }
+    if not renderable:
+        print("No active runs with data to plot yet -- waiting.")
+        return
+
     n_rows = 1 + len(plot_rows)
-    plt.subplots(n_rows, len(scan_data))
+    plt.subplots(n_rows, len(renderable))
 
     # Row heights: give the text-heavy top grid just enough to show its lines
     # (~16 rows fits all 6 without clipping) and split everything else evenly
@@ -311,7 +343,7 @@ def plot_status(scan_data, args):
 
     categories = ['single_pore', 'saturated', 'zero', 'unavailable', 'reserved_pore', 'other', 'multiple']
 
-    for posname, mux_data in scan_data.items():
+    for posname, mux_data in renderable.items():
         n_plot += 1
 
         latest_time, latest_counts = mux_data[-1]
@@ -463,19 +495,32 @@ def get_pore_occupancy(connection, timeout=8.0):
         n_channels = 3000
 
     # get_channel_states streams the current state of every channel first, then
-    # streams updates forever -- take the initial snapshot and cancel.
+    # streams updates forever -- take the initial snapshot and cancel. On a PAUSED
+    # run the channel states are frozen, so NO update messages follow the snapshot;
+    # the old "snapshot complete once a message adds no new channel" break needs a
+    # further message to evaluate, so `for resp in stream` would block forever on
+    # the next() and hang the whole monitor loop. Two guards prevent that: break as
+    # soon as every channel is in (the snapshot is then complete on its own, no
+    # follow-up needed), and bound the stream with `_timeout` so a stalled next()
+    # raises grpc.RpcError instead of blocking -- in which case we still use the
+    # snapshot already collected.
     latest = {}
     deadline = time.time() + timeout
     stream = connection.data.get_channel_states(
-        first_channel=1, last_channel=n_channels, use_channel_states_ids=False)
+        first_channel=1, last_channel=n_channels, use_channel_states_ids=False,
+        _timeout=timeout)
     try:
         for resp in stream:
             before = len(latest)
             for cs in resp.channel_states:
                 latest[cs.channel] = cs.state_name
-            # snapshot is complete once a message stops adding new channels
-            if (latest and len(latest) == before) or time.time() > deadline:
+            # complete once every channel is in, or a message adds nothing new, or
+            # we pass the deadline
+            if (len(latest) >= n_channels or (latest and len(latest) == before)
+                    or time.time() > deadline):
                 break
+    except grpc.RpcError:
+        pass  # deadline hit waiting for a never-coming update -> use the snapshot
     finally:
         stream.cancel()
 
@@ -525,7 +570,7 @@ def get_flowcell_yields(args):
                     bvt = 'ReadCounts'
 
                 n50 = connection.statistics.read_length_n50(acquisition_run_id=acquisition_info.run_id)
-                len_hist = connection.statistics.stream_read_length_histogram(acquisition_run_id=acquisition_info.run_id, bucket_value_type=bvt, discard_outlier_percent=0.25)
+                len_hist = connection.statistics.stream_read_length_histogram(acquisition_run_id=acquisition_info.run_id, bucket_value_type=bvt, discard_outlier_percent=0.25, _timeout=_STREAM_TIMEOUT_S)
                 len_hist = len_hist.next()
 
                 # Extract values from histogram_data
@@ -594,9 +639,24 @@ def get_flowcell_yields(args):
                     'duty_groups': duty_groups,
                     'phase': prot_info.phase
                 }
-            except AttributeError as e:
-                print(f"Error accessing fields: {e}")
-                yields[position.name] = f"Error accessing acquisition info fields: {e}"
+            except (AttributeError, grpc.RpcError) as e:
+                # Two per-position, transient failure modes, neither of which
+                # should crash the whole monitor loop:
+                #   * AttributeError -- a protobuf field mismatch;
+                #   * grpc.RpcError  -- most commonly a FAILED_PRECONDITION
+                #     ("Cannot find the requested statistics for that
+                #     acquisition") from the statistics RPCs (read_length_n50,
+                #     histogram, duty-time) on a run that just started and has no
+                #     statistics computed yet.
+                # Surface it as an error string so plot_status skips this position
+                # this cycle (it filters out non-dict yields); once the run has
+                # produced data the next poll renders it normally.
+                try:
+                    detail = e.details() or e.code().name if isinstance(e, grpc.RpcError) else str(e)
+                except Exception:
+                    detail = str(e)   # bare RpcError with no code()/details()
+                print(f"Position {position.name}: stats not ready / field error: {detail}")
+                yields[position.name] = f"No renderable data yet: {detail}"
         else:
             yields[position.name] = f"No active sequencing run (Status: {run_info.status})"
                 
@@ -754,14 +814,16 @@ def maybe_notify_flatline(connection, args, posname, flatline_notified, last_tri
     de-duplicates (one alert per episode) and is cleared on real recovery.
 
     A mux scan legitimately drops throughput to ~0, so nothing alerts while one
-    runs; and if --auto-mux-scan just fired for this position (within the mux-scan
-    cooldown), that path's own alert stands and this one stays quiet.
+    runs; a PAUSED run (or one pausing/resuming) is also ~0 by design, so it's
+    skipped too; and if --auto-mux-scan just fired for this position (within the
+    mux-scan cooldown), that path's own alert stands and this one stays quiet.
     """
     if not args.ntfy:
         return
     try:
         run_info = connection.protocol.get_run_info()
-        if is_mux_scanning(run_info.phase):
+        # A mux scan or a pause zeroes throughput by design -- neither is a stall.
+        if is_mux_scanning(run_info.phase) or is_paused(run_info.phase):
             return
 
         acq = connection.acquisition.get_acquisition_info()
@@ -773,7 +835,14 @@ def maybe_notify_flatline(connection, args, posname, flatline_notified, last_tri
         series = get_activity_series(connection, acq.run_id)
         is_flat, info = detect_flatline(series, args, min_time=min_time)
     except Exception as e:
-        print(f"  [{posname}] flatline notify check failed: {e}")
+        # A just-started run has no statistics yet -> get_activity_series raises a
+        # gRPC FAILED_PRECONDITION. Harmless here (nothing to alert on yet); log it
+        # concisely rather than dumping the multi-line gRPC repr.
+        try:
+            detail = e.details() or e.code().name if isinstance(e, grpc.RpcError) else str(e)
+        except Exception:
+            detail = str(e)
+        print(f"  [{posname}] flatline notify check skipped: {detail}")
         return
 
     recent = info.get('recent')
