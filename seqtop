@@ -7,8 +7,48 @@ import grpc
 import plotext as plt
 from collections import defaultdict
 import time
+import os
+import shutil
 import numpy as np
 import argparse
+
+
+def human_bytes(n):
+    """Bytes -> a `df -h`-style string using powers of 1024 (e.g. 1.2T, 850G,
+    512M). One decimal below 10, whole numbers above, to match df's look."""
+    n = float(n)
+    for unit in ('B', 'K', 'M', 'G', 'T', 'P'):
+        if n < 1024 or unit == 'P':
+            if unit == 'B':
+                return f"{int(n)}B"
+            return f"{n:.1f}{unit}" if n < 10 else f"{n:.0f}{unit}"
+        n /= 1024.0
+
+
+def disk_usage_for(path):
+    """Free-space info for the filesystem that holds `path` (the disk the run is
+    writing to). Climbs to the nearest existing ancestor so an output dir that
+    isn't created yet still resolves to the right mount. Returns a dict with
+    human-readable `free`/`total` and integer `pct_used`, or None on failure."""
+    try:
+        p = os.path.abspath(path) if path else "/"
+        while p and not os.path.exists(p):
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
+        if not os.path.exists(p):
+            p = "/"
+        u = shutil.disk_usage(p)
+        # Match df's "Use%": it divides used by (used + available-to-user), which
+        # excludes the root-reserved blocks, and rounds up -- so used/total alone
+        # reads a few points low. denom == used + free here (free = avail to user).
+        denom = u.used + u.free
+        pct_used = -(-100 * u.used // denom) if denom else 0  # ceil, as df does
+        return {'free': human_bytes(u.free), 'total': human_bytes(u.total),
+                'pct_used': pct_used}
+    except Exception:
+        return None
 
 # Deadline (seconds) for the "take the first response then cancel" statistics
 # streams. Their first response is computed server-side and arrives in well under
@@ -374,11 +414,19 @@ def plot_status(scan_data, args):
             occ_txt = "Occupancy: n/a"
         else:
             occ_txt = f"Occupancy: {round(occ*100)}% ({yields[posname]['seq_pores']}/{yields[posname]['seq_pores']+yields[posname]['avail_pores']})"
-        plt.text(occ_txt, 0, 4, alignment='left', color="green+")
-        plt.text(f"{yields[posname]['yield_gb']} Gbases", 0, 3,  alignment='left', color="blue+")
-        plt.text(f"{yields[posname]['reads']} Reads", 0, 2,  alignment='left', color="blue+")
-        plt.text(f"{yields[posname]['wrote_gb']} Gbytes", 0, 1, alignment='left', color="blue+")
-        plt.text(f"N50 {yields[posname]['n50']} bp", 0, 0,  alignment='left', color="blue+")
+        plt.text(occ_txt, 0, 5, alignment='left', color="green+")
+        plt.text(f"{yields[posname]['yield_gb']} Gbases", 0, 4,  alignment='left', color="blue+")
+        plt.text(f"{yields[posname]['reads']} Reads", 0, 3,  alignment='left', color="blue+")
+        plt.text(f"{yields[posname]['wrote_gb']} Gbytes", 0, 2, alignment='left', color="blue+")
+        plt.text(f"N50 {yields[posname]['n50']} bp", 0, 1,  alignment='left', color="blue+")
+        disk = yields[posname].get('disk')
+        if disk:
+            disk_txt = f"Disk free: {disk['free']} / {disk['total']} ({disk['pct_used']}% used)"
+            disk_color = "red+" if disk['pct_used'] >= 90 else "blue+"
+        else:
+            disk_txt = "Disk free: n/a"
+            disk_color = "blue+"
+        plt.text(disk_txt, 0, 0, alignment='left', color=disk_color)
         plt.xlim(0, None)
         plt.xticks([])
         plt.yticks([])
@@ -625,6 +673,8 @@ def get_flowcell_yields(args):
                     'reads': read_count,
                     'run_id': acquisition_info.run_id,
                     'reads_directory': acquisition_info.config_summary.reads_directory,
+                    'disk': disk_usage_for(prot_info.output_path
+                                           or acquisition_info.config_summary.reads_directory),
                     'sample': user_info.sample_id.value,
                     'flowcell_type': prot_info.flow_cell.product_code,
                     'flowcell_id': prot_info.flow_cell.flow_cell_id,
@@ -702,9 +752,12 @@ def send_ntfy_update(args, scan_data):
         available = available_pores(mux_data[-1][1]) if mux_data else '?'
         occ = y.get('occupancy')
         occ_txt = 'n/a' if occ is None else f"{round(occ * 100)}%"
+        disk = y.get('disk')
+        disk_txt = f"{disk['free']} free" if disk else 'n/a'
         lines.append(
             f"{posname} ({y.get('sample', '?')}): "
-            f"{y.get('yield_gb', '?')} Gbp | {available} pores avail | {occ_txt} occupancy"
+            f"{y.get('yield_gb', '?')} Gbp | {available} pores avail | {occ_txt} occupancy "
+            f"| {disk_txt}"
         )
 
     body = "\n".join(lines) if lines else "No active sequencing runs."
