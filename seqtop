@@ -755,9 +755,9 @@ def send_ntfy_update(args, scan_data):
         disk = y.get('disk')
         disk_txt = f"{disk['free']} free" if disk else 'n/a'
         lines.append(
-            f"{posname} ({y.get('sample', '?')}): "
+            f"* {posname} ({y.get('sample', '?')}): "
             f"{y.get('yield_gb', '?')} Gbp | {available} pores avail | {occ_txt} occupancy "
-            f"| {disk_txt}"
+            f"| {disk_txt}\n"
         )
 
     body = "\n".join(lines) if lines else "No active sequencing runs."
